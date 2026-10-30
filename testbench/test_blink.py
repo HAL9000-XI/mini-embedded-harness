@@ -1,96 +1,147 @@
-#!/usr/bin/env python3
+
 import os
 import re
 import sys
 import time
-from serial import Serial, SerialException
+
+from serial import Serial
 from serial.tools import list_ports
+from serial import SerialException
 
 BAUD = 115200
-TEST_SECONDS = 18
 MIN_TRANSITIONS = 8
-MIN_INTERVAL_MS = 350
-MAX_INTERVAL_MS = 700
+TEST_TIMEOUT_SECONDS = 18
 
-def choose_port():
-    configured = os.environ.get("ESP32_PORT")
+
+def find_port():
+    configured = os.getenv("ESP32_PORT")
+
     if configured:
         return configured
 
     ports = list(list_ports.comports())
-    # Common USB-UART bridges: CP210x, CH340, FTDI; native Espressif USB.
-    known = []
-    for p in ports:
-        if p.vid in (0x10C4, 0x1A86, 0x0403, 0x303A):
-            known.append(p.device)
 
-    if len(known) == 1:
-        return known[0]
-    if len(ports) == 1:
-        return ports[0].device
+    # Common USB-to-serial chip identifiers.
+    known_ids = {
+        (0x10C4, 0xEA60),  # Silicon Labs CP210x
+        (0x1A86, 0x7523),  # CH340
+        (0x1A86, 0x55D4),  # CH9102
+        (0x0403, 0x6001),  # FTDI
+        (0x303A, 0x1001),  # Espressif USB JTAG/serial
+    }
 
-    found = ", ".join(p.device for p in ports) or "none"
+    matches = [
+        port.device
+        for port in ports
+        if (port.vid, port.pid) in known_ids
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if not matches:
+        raise RuntimeError(
+            "No supported ESP32 USB serial port found. "
+            "Set ESP32_PORT to the correct serial device."
+        )
+
     raise RuntimeError(
-        f"Could not uniquely identify ESP32 serial port (found: {found}). "
-        "Set ESP32_PORT, e.g. /dev/ttyUSB0."
+        f"Multiple possible ESP32 ports found: {matches}. "
+        "Set ESP32_PORT to the correct serial device."
     )
 
+
 def main():
-    port = choose_port()
+    port = find_port()
     print(f"Using ESP32 serial port: {port}")
-    transitions = []
+
     boot_seen = False
-    deadline = time.monotonic() + TEST_SECONDS
+    transitions = []
+    deadline = time.monotonic() + TEST_TIMEOUT_SECONDS
 
     try:
-        # Opening the port may reset some DevKit boards; wait for boot marker.
         with Serial(port, BAUD, timeout=0.25) as ser:
+            # Reset the ESP32 to capture its boot message.
+            ser.dtr = False
+            ser.rts = True
+            time.sleep(0.1)
+            ser.rts = False
+            time.sleep(0.1)
+            ser.reset_input_buffer()
+
             while time.monotonic() < deadline:
                 raw = ser.readline()
+
                 if not raw:
                     continue
-                line = raw.decode("utf-8", errors="replace").strip()
+
+                line = raw.decode(
+                    "utf-8", errors="replace"
+                ).strip()
+
                 print(line)
 
                 if "HARNESS:BOOT" in line:
                     boot_seen = True
 
-                match = re.search(r"HARNESS:LED=([01]);T=(\d+)", line)
+                match = re.search(
+                    r"HARNESS:LED=([01]);T=(\d+)", line
+                )
+
                 if match:
-                    transitions.append((int(match.group(1)), int(match.group(2))))
+                    state = int(match.group(1))
+                    timestamp = int(match.group(2))
+                    transitions.append((state, timestamp))
+
                     if len(transitions) >= MIN_TRANSITIONS:
                         break
 
     except SerialException as exc:
-        raise RuntimeError(f"Serial communication failed: {exc}") from exc
+        raise RuntimeError(
+            f"Serial communication failed: {exc}"
+        ) from exc
 
     if not boot_seen:
         raise AssertionError("Boot marker not observed")
+
     if len(transitions) < MIN_TRANSITIONS:
         raise AssertionError(
-            f"Expected at least {MIN_TRANSITIONS} transitions; got {len(transitions)}"
+            f"Expected at least {MIN_TRANSITIONS} LED transitions, "
+            f"got {len(transitions)}"
         )
 
-    states = [state for state, _ in transitions]
-    if any(states[i] == states[i - 1] for i in range(1, len(states))):
-        raise AssertionError(f"LED states did not alternate: {states}")
+    # Check that LED states alternate.
+    for previous, current in zip(
+        transitions, transitions[1:]
+    ):
+        if previous[0] == current[0]:
+            raise AssertionError(
+                "LED states did not alternate"
+            )
 
+    # Check that blink intervals are approximately 500 ms.
     intervals = [
-        transitions[i][1] - transitions[i - 1][1]
-        for i in range(1, len(transitions))
+        current[1] - previous[1]
+        for previous, current in zip(
+            transitions, transitions[1:]
+        )
     ]
-    bad = [dt for dt in intervals if not MIN_INTERVAL_MS <= dt <= MAX_INTERVAL_MS]
-    if bad:
-        raise AssertionError(f"Blink interval outside tolerance: {bad}; all={intervals}")
+
+    for interval in intervals:
+        if not 350 <= interval <= 700:
+            raise AssertionError(
+                f"Blink interval out of range: {interval} ms"
+            )
 
     print(
-        "PASS: boot marker, alternating GPIO reports and blink timing verified. "
-        f"Intervals (ms): {intervals}"
+        f"PASS: boot marker observed, "
+        f"{len(transitions)} transitions verified."
     )
+
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
+    except (AssertionError, RuntimeError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         sys.exit(1)
