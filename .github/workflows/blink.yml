@@ -1,0 +1,58 @@
+name: ESP32 blink hardware test
+
+on:
+  workflow_dispatch:
+
+# This workflow is intentionally manual for the proof of concept.
+# Only run it from your trusted private repository.
+permissions:
+  contents: read
+
+jobs:
+  hardware-test:
+    # Register your Ubuntu PC with BOTH labels below.
+    runs-on: [self-hosted, linux, x64, esp32-testbench]
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO and test dependencies
+        run: |
+          python -m pip install --user --upgrade platformio pyserial
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Flash ESP32 over USB
+        env:
+          ESP32_PORT: ${{ vars.ESP32_PORT }}
+        run: |
+          if [ -n "$ESP32_PORT" ]; then
+            pio run --target upload --upload-port "$ESP32_PORT"
+          else
+            pio run --target upload
+          fi
+
+      - name: Run blink test
+        env:
+          ESP32_PORT: ${{ vars.ESP32_PORT }}
+        run: |
+          python -m pip install --user pyserial
+          python testbench/test_blink.py
+
+      - name: Upload firmware and test build metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-blink-build
+          path: .pio/build/esp32dev/
+          if-no-files-found: warn
+          retention-days: 7
